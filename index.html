@@ -1,0 +1,846 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vaultezos: Tezos Keyed Local Vault</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Mobile-First and Aesthetic Styles */
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7f3e8; /* Old paper background */
+        }
+        .vault-container {
+            border: 4px solid #4a4a4a;
+            box-shadow: 8px 8px 0 0 rgba(0, 0, 0, 0.2);
+            background-color: #fcfcf4;
+            max-width: 600px;
+        }
+        .input-field {
+            border: 1px solid #7c7c7c;
+            background-color: #ffffff;
+            font-family: monospace;
+            padding: 0.75rem; 
+        }
+        .sketch-lock {
+            filter: drop-shadow(2px 2px 1px rgba(0,0,0,0.3));
+        }
+        /* Style for the "secret" history button */
+        #history-button {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            padding: 4px;
+            background: #e0e0e0;
+            color: #4a4a4a;
+            border-radius: 4px;
+            border: 1px solid #4a4a4a;
+            font-size: 10px;
+            line-height: 1;
+            font-weight: bold;
+            opacity: 0.7;
+            transition: all 0.2s;
+        }
+        #history-button:hover {
+            opacity: 1;
+            background: #fff;
+            box-shadow: 0 0 5px rgba(0, 0, 0, 0.2);
+        }
+    </style>
+</head>
+<body>
+
+
+    <script type="text/javascript">
+        // --- Global State & Keys ---
+        const WALLET_HASH_KEY = 'walletHash';
+        const LOGIN_LOGS_KEY = 'loginLogs'; // Key for persistent login history
+        let enrolledWalletHash = localStorage.getItem(WALLET_HASH_KEY);
+        let currentRecords = []; 
+
+
+        // --- UI Element Variables (Declared globally, assigned on load) ---
+        let mainApp, enrollButton, loadButton, saveButton, addButton, recordsList, statusMessage, addSection, confirmButton;
+        let recordNameInput, recordIdentifierInput, recordSecretInput, walletFileLoader, walletAddressDisplay;
+        let walletAddressEnrollInput, walletEnrollModal, confirmEnrollButton;
+        let textInputModal, textInputModalTitle, textInputModalStatus, textInputModalInput, confirmTextInputButton, cancelTextInputButton;
+        let accessGateModal, accessGateInput, confirmAccessGateButton, accessGateStatus;
+        // New History Modal elements
+        let historyButton, loginHistoryModal, loginHistoryList;
+        
+        // Global callback for modal submission
+        let textInputModalCallback = null;
+
+
+        // --- Utility & Crypto Functions ---
+        
+        // Secure Hashing function for wallet address
+        const sha256 = async (message) => {
+            const msgBuffer = new TextEncoder().encode(message);
+            const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
+            const hashArray = Array.from(new Uint8Array(hashBuffer));
+            const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+            return hashHex;
+        };
+
+
+        // Base64 conversion helpers
+        const str2ab = (str) => new TextEncoder().encode(str);
+        const ab2b64 = (buffer) => btoa(String.fromCharCode(...new Uint8Array(buffer)));
+        const b642ab = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0)).buffer;
+        
+        // Key Derivation (Password to Key)
+        const deriveKey = async (password, salt, usage) => {
+            const keyMaterial = await crypto.subtle.importKey(
+                "raw",
+                str2ab(password),
+                { name: "PBKDF2" },
+                false,
+                ["deriveKey"]
+            );
+            return crypto.subtle.deriveKey(
+                {
+                    name: "PBKDF2",
+                    salt: salt,
+                    iterations: 100000, 
+                    hash: "SHA-256",
+                },
+                keyMaterial,
+                { name: "AES-GCM", length: 256 },
+                true,
+                usage
+            );
+        };
+
+
+        // Data Encryption
+        const encryptData = async (data, walletHash) => {
+            const salt = crypto.getRandomValues(new Uint8Array(16));
+            const iv = crypto.getRandomValues(new Uint8Array(12)); 
+            
+            const key = await deriveKey(walletHash, salt, ["encrypt"]);
+            const encryptedContent = await crypto.subtle.encrypt(
+                { name: "AES-GCM", iv: iv },
+                key,
+                str2ab(JSON.stringify(data))
+            );
+
+
+            return {
+                encryptedData: ab2b64(encryptedContent),
+                salt: ab2b64(salt),
+                iv: ab2b64(iv),
+                algorithm: "AES-GCM-256"
+            };
+        };
+
+
+        // Data Decryption
+        const decryptData = async (encryptedPayload, walletHash) => {
+            const { encryptedData, salt, iv, algorithm } = encryptedPayload;
+
+
+            if (algorithm !== "AES-GCM-256") {
+                throw new Error("Unsupported encryption algorithm.");
+            }
+
+
+            const saltAb = b642ab(salt);
+            const ivAb = b642ab(iv);
+            const encryptedDataAb = b642ab(encryptedData);
+
+
+            const key = await deriveKey(walletHash, saltAb, ["decrypt"]);
+            
+            const decryptedContent = await crypto.subtle.decrypt(
+                { name: "AES-GCM", iv: ivAb },
+                key,
+                encryptedDataAb
+            );
+
+
+            const decryptedString = new TextDecoder().decode(decryptedContent);
+            return JSON.parse(decryptedString);
+        };
+        
+        // --- Login History Management ---
+
+
+        const getLoginHistory = () => {
+            try {
+                const logs = localStorage.getItem(LOGIN_LOGS_KEY);
+                return logs ? JSON.parse(logs) : [];
+            } catch (e) {
+                console.error("Error reading login logs:", e);
+                return [];
+            }
+        };
+
+
+        const recordSuccessfulLogin = (addressHash) => {
+            const history = getLoginHistory();
+            const newLog = { 
+                addressHash: addressHash, 
+                timestamp: new Date().toISOString() 
+            };
+            history.unshift(newLog); // Add to the front for chronological order
+            // Keep logs manageable (e.g., last 50 entries)
+            const updatedHistory = history.slice(0, 50); 
+            localStorage.setItem(LOGIN_LOGS_KEY, JSON.stringify(updatedHistory));
+        };
+
+
+        const showLoginHistoryModal = () => {
+            const history = getLoginHistory();
+            loginHistoryList.innerHTML = '';
+            
+            if (history.length === 0) {
+                loginHistoryList.innerHTML = '<p class="text-center p-4 text-gray-500 italic">No login history found yet.</p>';
+            } else {
+                history.forEach((log, index) => {
+                    const item = document.createElement('div');
+                    item.className = `p-3 text-sm border-b border-gray-200 ${index % 2 === 0 ? 'bg-gray-50' : 'bg-white'}`;
+                    
+                    const date = new Date(log.timestamp).toLocaleString();
+                    
+                    // --- Truncate the full 64-char SHA-256 hash for display ---
+                    const hashDisplay = `${log.addressHash.substring(0, 10)}...${log.addressHash.slice(-8)}`;
+                    
+                    item.innerHTML = `
+                        <p class="font-bold text-gray-800">Tezos Key Hash: <span class="font-mono text-xs text-indigo-600">${hashDisplay}</span></p>
+                        <p class="text-xs text-gray-600">Time: ${date}</p>
+                    `;
+                    loginHistoryList.appendChild(item);
+                });
+            }
+
+
+            loginHistoryModal.classList.remove('hidden');
+        };
+
+
+        // --- Authentication/Enrollment Logic ---
+
+
+        const showEnrollModal = () => {
+            walletAddressEnrollInput.value = '';
+            walletEnrollModal.classList.remove('hidden');
+            walletAddressEnrollInput.focus();
+        };
+
+
+        const handleEnrollWallet = async () => {
+            const address = walletAddressEnrollInput.value.trim();
+            if (address.length < 20) {
+                updateStatus("Please enter a valid-looking Tezos wallet address.", 'text-red-600');
+                return;
+            }
+
+
+            updateStatus("Enrolling wallet key...", 'text-indigo-600');
+            
+            try {
+                const newHash = await sha256(address);
+                localStorage.setItem(WALLET_HASH_KEY, newHash);
+                enrolledWalletHash = newHash;
+                updateStatus("Wallet Key Enrolled successfully!", 'text-green-600');
+                walletEnrollModal.classList.add('hidden');
+                
+                // After successful enrollment, automatically log in
+                recordSuccessfulLogin(newHash); 
+                showMainApp();
+                updateUI();
+            } catch (error) {
+                updateStatus(`Enrollment failed: ${error.message}`, 'text-red-600');
+                console.error("Enrollment failed:", error);
+            }
+        };
+
+
+        const showAccessGate = () => {
+             // Only show if a key is enrolled
+            if (enrolledWalletHash) {
+                accessGateInput.value = '';
+                accessGateModal.classList.remove('hidden');
+                accessGateInput.focus();
+                accessGateStatus.textContent = "Please enter your enrolled Tezos wallet address to unlock Vaultezos.";
+            } else {
+                showEnrollModal();
+            }
+        }
+
+
+        const handleAccessGateLogin = async () => {
+            const inputAddress = accessGateInput.value.trim();
+            if (inputAddress.length < 20) {
+                accessGateStatus.textContent = "Invalid address format.";
+                return;
+            }
+
+
+            try {
+                const inputHash = await sha256(inputAddress);
+                
+                if (inputHash === enrolledWalletHash) {
+                    // SUCCESS: Record the login before granting access
+                    recordSuccessfulLogin(inputHash); 
+                    
+                    accessGateModal.classList.add('hidden');
+                    updateStatus("Access granted. Vaultezos unlocked.", 'text-green-600');
+                    showMainApp();
+                } else {
+                    accessGateStatus.textContent = "Access Denied. Key does not match the enrolled hash.";
+                }
+            } catch (error) {
+                accessGateStatus.textContent = "Error during verification.";
+                console.error("Login hash error:", error);
+            }
+        }
+
+
+        const showMainApp = () => {
+            mainApp.classList.remove('hidden');
+        }
+        
+        // --- Generic Text Input Modal Management ---
+
+
+        const showTextInputModal = (mode) => {
+            textInputModal.classList.remove('hidden');
+            textInputModalInput.value = '';
+            
+            if (mode === 'load') {
+                textInputModalTitle.textContent = "Enter Crypto Wallet Address (Decryption Key)";
+                textInputModalStatus.textContent = "Provide the address used to encrypt the file you wish to load.";
+                textInputModalInput.type = 'text'; 
+                textInputModalInput.placeholder = "Tezos Wallet Address (tz...)"
+                textInputModalCallback = handleFileLoad;
+            } else if (mode === 'save') {
+                textInputModalTitle.textContent = "Enter Filename";
+                textInputModalStatus.textContent = "What would you like to name your encrypted data file? (e.g., Vaultezos-Backup)";
+                textInputModalInput.type = 'text'; 
+                textInputModalInput.placeholder = "Filename"
+                textInputModalCallback = handleFileSave;
+            }
+            textInputModalInput.focus();
+        };
+
+
+        const hideTextInputModal = () => {
+            textInputModal.classList.add('hidden');
+        };
+
+
+        const handleTextInputConfirmation = () => {
+            const value = textInputModalInput.value.trim();
+            
+            if (!value) {
+                textInputModalStatus.textContent = "Input cannot be empty.";
+                return;
+            }
+            
+            // Validation for Load (address input)
+            if (textInputModalCallback === handleFileLoad && value.length < 20) {
+                 textInputModalStatus.textContent = "Please enter a valid wallet address (at least 20 characters).";
+                 return;
+            }
+
+
+            if (textInputModalCallback) {
+                // Pass the input value (address or filename) to the designated handler
+                textInputModalCallback(value);
+            }
+            hideTextInputModal();
+        };
+
+
+        // --- File I/O Logic ---
+
+
+        const handleFileLoad = async (inputAddress) => {
+            walletFileLoader.click(); // Trigger file selection
+            
+            walletFileLoader.onchange = async (event) => {
+                const file = event.target.files[0];
+                if (!file) {
+                    updateStatus("File load cancelled.", 'text-gray-700');
+                    return;
+                }
+
+
+                updateStatus("Reading and validating file...", 'text-indigo-600');
+                const fileReader = new FileReader();
+                fileReader.onload = async (e) => {
+                    try {
+                        const fileContent = JSON.parse(e.target.result);
+                        
+                        // 1. Validate the file's wallet hash against the input
+                        const fileWalletHash = fileContent.metadata.walletHash;
+                        const inputHash = await sha256(inputAddress);
+
+
+                        if (fileWalletHash !== inputHash) {
+                            updateStatus("Access Denied. Wallet address does not match the file's decryption key.", 'text-red-600');
+                            return;
+                        }
+
+
+                        // 2. Hash matches! Attempt Decryption using the input hash
+                        const decryptedData = await decryptData(fileContent.encryption, inputHash);
+                        
+                        currentRecords = decryptedData.records || [];
+                        updateStatus(`File loaded successfully. ${currentRecords.length} records retrieved.`, 'text-green-600');
+                        renderRecords();
+
+
+                    } catch (error) {
+                        updateStatus(`File Decryption Error: Check your wallet address and file integrity.`, 'text-red-600');
+                        console.error("Decryption/Load Error:", error);
+                    }
+                };
+                fileReader.readAsText(file);
+                // Reset input for next time
+                walletFileLoader.value = null; 
+            };
+        };
+
+
+        const handleFileSave = async (filename) => {
+            if (currentRecords.length === 0) {
+                updateStatus("No records to save!", 'text-red-600');
+                return;
+            }
+            if (!enrolledWalletHash) {
+                updateStatus("Enroll a wallet key before saving.", 'text-red-600');
+                return;
+            }
+
+
+            updateStatus("Encrypting data for download...", 'text-indigo-600');
+            
+            try {
+                const exportableData = { records: currentRecords }; 
+                const encryptedPayload = await encryptData(exportableData, enrolledWalletHash);
+                
+                const downloadContent = {
+                    metadata: {
+                        timestamp: new Date().toISOString(),
+                        walletHash: enrolledWalletHash, 
+                        version: "1.0-encrypted-tezos"
+                    },
+                    encryption: encryptedPayload
+                };
+
+
+                // Ensure filename ends with .json
+                let finalFilename = filename.endsWith('.json') ? filename : `${filename}.json`;
+
+
+                const dataStr = JSON.stringify(downloadContent, null, 2);
+                const blob = new Blob([dataStr], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                
+                // Trigger download
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = finalFilename; 
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+
+
+                updateStatus(`Encrypted data file "${finalFilename}" downloaded successfully.`, 'text-green-600');
+
+
+            } catch (error) {
+                console.error("Encryption/Export Error:", error);
+                updateStatus(`Save failed: ${error.message}`, 'text-red-600');
+            }
+        };
+
+
+        // --- Record Management ---
+
+
+        const addRecord = () => {
+            const name = recordNameInput.value.trim();
+            const identifier = recordIdentifierInput.value.trim();
+            const secret = recordSecretInput.value.trim();
+
+
+            if (!name || !identifier || !secret) {
+                updateStatus("All fields are required.", 'text-red-600');
+                return;
+            }
+            if (!enrolledWalletHash) {
+                updateStatus("Please enroll a wallet address before adding records.", 'text-red-600');
+                return;
+            }
+
+
+            const newRecord = {
+                name: name,
+                identifier: identifier,
+                secret: secret, 
+                createdAt: new Date().toISOString()
+            };
+
+
+            currentRecords.push(newRecord);
+            renderRecords();
+
+
+            updateStatus("Record added to current session (save to file).", 'text-green-600');
+            recordNameInput.value = '';
+            recordIdentifierInput.value = '';
+            recordSecretInput.value = '';
+            addSection.classList.add('hidden');
+        };
+
+
+        // --- UI Functions ---
+
+
+        const updateStatus = (message, color = 'text-gray-700') => {
+            statusMessage.textContent = message;
+            statusMessage.className = `mt-4 text-sm font-semibold ${color}`;
+        };
+
+
+        const updateUI = () => {
+            if (enrolledWalletHash) {
+                // Display truncated hash for enrolled key confirmation
+                const truncatedHash = `${enrolledWalletHash.substring(0, 8)}...${enrolledWalletHash.slice(-8)}`;
+                walletAddressDisplay.textContent = `Enrolled Key (Hash: ${truncatedHash})`;
+                walletAddressDisplay.classList.remove('text-red-500');
+                walletAddressDisplay.classList.add('text-green-600');
+                enrollButton.textContent = "Re-enroll Wallet Key";
+                loadButton.disabled = false;
+                saveButton.disabled = false;
+                addButton.disabled = false;
+                historyButton.classList.remove('hidden'); // Show history button once logged in
+
+
+                if (currentRecords.length === 0) {
+                     recordsList.innerHTML = '<p class="text-center text-gray-500 italic p-6">Click "Load Data File" to begin.</p>';
+                }
+            } else {
+                walletAddressDisplay.textContent = 'STATUS: No Wallet Key Enrolled.';
+                walletAddressDisplay.classList.remove('text-green-600');
+                walletAddressDisplay.classList.add('text-red-500');
+                enrollButton.textContent = "Enroll Wallet Key";
+                loadButton.disabled = true;
+                saveButton.disabled = true;
+                addButton.disabled = true;
+                historyButton.classList.add('hidden'); // Hide history button when logged out
+                recordsList.innerHTML = '<p class="text-center text-gray-500 p-4">Please enroll a wallet key first.</p>';
+            }
+        };
+
+
+        const renderRecords = () => {
+            recordsList.innerHTML = ''; 
+            if (currentRecords.length === 0) {
+                recordsList.innerHTML = '<p class="text-center text-gray-500 italic p-6">No records loaded.</p>';
+                return;
+            }
+
+
+            // Sort by creation time, latest first
+            currentRecords.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+
+            currentRecords.forEach(record => {
+                // Secrets are shown once the file is decrypted and loaded into the session
+                const item = document.createElement('div');
+                item.className = 'p-4 border-b border-gray-300 hover:bg-yellow-50/50 transition duration-150';
+                item.innerHTML = `
+                    <div class="flex justify-between items-start">
+                        <div class="flex flex-col">
+                            <h3 class="font-bold text-base text-gray-800">${record.name}</h3>
+                            <p class="text-xs text-gray-600 mt-1">Identifier: <span class="font-mono text-xs p-1 bg-yellow-100 rounded">${record.identifier}</span></p>
+                            <p class="text-xs text-gray-600 mt-1">Secret: <span class="font-mono text-xs p-1 bg-green-200 rounded">${record.secret}</span></p>
+                            <p class="text-xs text-gray-400 mt-1">Added: ${new Date(record.createdAt).toLocaleDateString()}</p>
+                        </div>
+                    </div>
+                `;
+                recordsList.appendChild(item);
+            });
+        };
+
+
+        // --- Event Listener Setup (Ensures DOM is ready) ---
+
+
+        const setupEventListeners = () => {
+            // Assign DOM elements to variables
+            mainApp = document.getElementById('main-app');
+            enrollButton = document.getElementById('enroll-button');
+            loadButton = document.getElementById('load-button');
+            saveButton = document.getElementById('save-button');
+            addButton = document.getElementById('add-button');
+            recordsList = document.getElementById('records-list');
+            statusMessage = document.getElementById('status-message');
+            addSection = document.getElementById('add-section');
+            confirmButton = document.getElementById('confirm-button');
+            recordNameInput = document.getElementById('record-name');
+            recordIdentifierInput = document.getElementById('record-identifier');
+            recordSecretInput = document.getElementById('record-secret');
+            walletFileLoader = document.getElementById('wallet-file-loader');
+            walletAddressDisplay = document.getElementById('wallet-address-display');
+            walletAddressEnrollInput = document.getElementById('wallet-address-enroll-input');
+            walletEnrollModal = document.getElementById('wallet-enroll-modal');
+            confirmEnrollButton = document.getElementById('confirm-enroll-button');
+            
+            // Generic Input Modal
+            textInputModal = document.getElementById('text-input-modal');
+            textInputModalTitle = document.getElementById('text-input-modal-title');
+            textInputModalStatus = document.getElementById('text-input-modal-status');
+            textInputModalInput = document.getElementById('text-input-modal-input');
+            confirmTextInputButton = document.getElementById('confirm-text-input-button');
+            cancelTextInputButton = document.getElementById('cancel-text-input-button');
+
+
+            // Access Gate Modal
+            accessGateModal = document.getElementById('access-gate-modal');
+            accessGateInput = document.getElementById('access-gate-input');
+            confirmAccessGateButton = document.getElementById('confirm-access-gate-button');
+            accessGateStatus = document.getElementById('access-gate-status');
+            
+            // History Modal
+            historyButton = document.getElementById('history-button');
+            loginHistoryModal = document.getElementById('login-history-modal');
+            loginHistoryList = document.getElementById('login-history-list');
+
+
+            // Attach listeners
+            enrollButton.addEventListener('click', showEnrollModal);
+            confirmEnrollButton.addEventListener('click', handleEnrollWallet);
+            
+            loadButton.addEventListener('click', () => {
+                if (enrolledWalletHash) { showTextInputModal('load'); }
+            });
+
+
+            saveButton.addEventListener('click', () => {
+                if (enrolledWalletHash) { showTextInputModal('save'); }
+            });
+
+
+            addButton.addEventListener('click', () => {
+                addSection.classList.toggle('hidden');
+                if (!addSection.classList.contains('hidden')) {
+                    recordNameInput.focus();
+                }
+            });
+            confirmButton.addEventListener('click', addRecord);
+            
+            confirmTextInputButton.addEventListener('click', handleTextInputConfirmation);
+            cancelTextInputButton.addEventListener('click', hideTextInputModal);
+
+
+            // Access Gate Listener
+            confirmAccessGateButton.addEventListener('click', handleAccessGateLogin);
+            accessGateInput.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') {
+                    handleAccessGateLogin();
+                }
+            });
+            
+            // History Button Listener
+            historyButton.addEventListener('click', showLoginHistoryModal);
+            document.getElementById('close-history-modal').addEventListener('click', () => {
+                loginHistoryModal.classList.add('hidden');
+            });
+
+
+        }
+
+
+        window.onload = () => {
+            setupEventListeners(); 
+            // Determine initial view: Access Gate or Enrollment
+            if (enrolledWalletHash) {
+                showAccessGate();
+            } else {
+                showEnrollModal();
+            }
+            updateUI();
+            updateStatus("Awaiting Tezos Key setup/verification...");
+        };
+
+
+    </script>
+
+
+    <!-- Hidden Input for File Selection (Triggered by JS) -->
+    <input type="file" id="wallet-file-loader" accept=".json" class="hidden">
+
+
+    <!-- Main Application UI (Hidden until authenticated) -->
+    <div id="main-app" class="hidden flex flex-col items-center justify-start min-h-screen p-4 bg-f7f3e8">
+        
+        <div class="vault-container w-full max-w-md rounded-xl p-6 transition duration-500">
+            
+            <!-- Header: Vault Aesthetic -->
+            <div class="text-center mb-6 relative border-b pb-2 border-gray-400">
+                
+                <!-- Secret History Button (Subtle border frame element) -->
+                <button id="history-button" class="hidden" title="View Login History">
+                    LOGS
+                </button>
+                
+                <!-- Da Vinci Sketch Lock SVG -->
+                <svg class="sketch-lock w-12 h-12 mx-auto mb-2 text-gray-800" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 1 0-9 0v3.75m.75 3h6.5l.5 7.5H9.75l.5-7.5Z"/>
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M12 14.25v2.25M14.25 10.5h-4.5"/>
+                </svg>
+                <h1 class="text-2xl font-bold text-gray-900">Vaultezos</h1>
+                <p class="text-sm font-semibold mt-2" id="wallet-address-display">
+                    STATUS: Checking local storage...
+                </p>
+                <p class="text-xs text-red-600 font-semibold mt-2">
+                    <span class="font-extrabold">SECURITY WARNING:</span> This demo uses local files, protected by your Tezos address HASH.
+                </p>
+            </div>
+
+
+            <!-- Enrollment/Action Buttons Row (Top Center) -->
+            <div class="mb-4 flex flex-col space-y-2">
+                <button id="enroll-button" class="w-full bg-indigo-600 text-white py-3 rounded-lg text-lg font-extrabold shadow-lg hover:bg-indigo-700 transition duration-300">
+                    Enroll Wallet Key
+                </button>
+                <div class="flex space-x-2">
+                    <button id="load-button" disabled class="flex-1 bg-gray-500 text-white py-3 rounded-lg text-lg font-extrabold shadow-lg hover:bg-gray-600 disabled:opacity-50 transition duration-300">
+                        Load Data File
+                    </button>
+                    <button id="save-button" disabled class="flex-1 bg-yellow-600 text-white py-3 rounded-lg text-lg font-extrabold shadow-lg hover:bg-yellow-700 disabled:opacity-50 transition duration-300">
+                        Save Data File
+                    </button>
+                </div>
+            </div>
+
+
+            <!-- Record List Display -->
+            <div class="max-h-72 overflow-y-auto border border-gray-300 rounded-lg shadow-inner bg-yellow-50">
+                <div id="records-list">
+                    <p class="text-center text-gray-500 p-4">Initializing...</p>
+                </div>
+            </div>
+
+
+            <!-- Add/Input Section -->
+            <div id="add-section" class="mt-6 p-4 border border-dashed border-gray-400 rounded-lg bg-white hidden">
+                <p class="text-sm font-bold mb-3 text-indigo-700 border-b pb-2">Add New Record (To Session)</p>
+                
+                <input id="record-name" type="text" placeholder="Account Name" class="input-field w-full p-3 mb-3 rounded shadow-sm focus:ring-1 focus:ring-gray-600">
+                <input id="record-identifier" type="text" placeholder="Identifier (Username, Email, etc.)" class="input-field w-full p-3 mb-3 rounded shadow-sm focus:ring-1 focus:ring-gray-600">
+                <input id="record-secret" type="password" placeholder="Secret Value" class="input-field w-full p-3 mb-4 rounded shadow-sm focus:ring-1 focus:ring-gray-600">
+                
+                <button id="confirm-button" class="w-full bg-gray-800 text-white py-3 rounded-lg text-lg font-bold hover:bg-gray-700 transition duration-150 shadow-md">
+                    Add Record to Session
+                </button>
+            </div>
+
+
+            <!-- Controls and Status -->
+            <div class="mt-6 flex flex-col items-center space-y-3">
+                <!-- Add Button -->
+                <button id="add-button" disabled class="w-full bg-green-600 text-white py-3 px-6 rounded-lg text-lg font-extrabold tracking-wider shadow-lg hover:bg-green-700 transition duration-300 transform hover:scale-[1.01] disabled:opacity-50">
+                    + Add New Record
+                </button>
+                
+                <p id="status-message" class="text-sm font-semibold text-gray-700">Initializing...</p>
+            </div>
+            
+        </div>
+
+
+    </div>
+
+
+    <!-- 1. Modal for LOGIN HISTORY (VIEW LOGS) -->
+    <div id="login-history-modal" class="hidden fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center p-4 z-50">
+        <div class="bg-white rounded-xl shadow-2xl w-full max-w-lg p-6 vault-container">
+            <h2 class="text-xl font-bold text-gray-900 border-b pb-2 mb-4 border-gray-400">Login History (Tezos Key Hashes)</h2>
+            <p class="text-sm text-gray-600 mb-4">
+                This log tracks every successful key verification used to unlock Vaultezos. The full Tezos address is *never* stored, only its cryptographic hash. The hash is truncated for display.
+            </p>
+
+
+            <div id="login-history-list" class="max-h-80 overflow-y-auto border border-gray-300 rounded-lg shadow-inner bg-yellow-50">
+                <!-- History items will be inserted here by JS -->
+            </div>
+            
+            <button id="close-history-modal" class="w-full mt-6 bg-gray-800 text-white py-3 rounded-lg font-bold hover:bg-gray-700 transition duration-150">
+                Close
+            </button>
+        </div>
+    </div>
+
+
+
+
+    <!-- 2. Modal for ACCESS GATE (LOGIN) -->
+    <div id="access-gate-modal" class="hidden fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center p-4 z-50">
+        <div class="bg-white rounded-xl shadow-2xl w-full max-w-sm p-6 vault-container">
+            <h2 class="text-2xl font-bold text-gray-900 border-b pb-2 mb-4 border-gray-400">Vaultezos Access Gate</h2>
+            <p id="access-gate-status" class="text-sm text-gray-700 font-semibold mb-4 h-10">
+                Please enter your enrolled Tezos wallet address to unlock Vaultezos.
+            </p>
+
+
+            <input id="access-gate-input" type="text" placeholder="Tezos Wallet Address (tz...)" class="input-field w-full p-3 mb-4 rounded shadow-sm focus:ring-2 focus:ring-indigo-500">
+            
+            <button id="confirm-access-gate-button" class="w-full bg-indigo-600 text-white py-3 rounded-lg font-bold hover:bg-indigo-700 transition duration-150">
+                Verify Key & Unlock
+            </button>
+        </div>
+    </div>
+
+
+
+
+    <!-- 3. Modal for WALLET KEY ENROLLMENT (SETUP) -->
+    <div id="wallet-enroll-modal" class="hidden fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center p-4 z-50">
+        <div class="bg-white rounded-xl shadow-2xl w-full max-w-sm p-6 vault-container">
+            <h2 class="text-xl font-bold text-gray-900 border-b pb-2 mb-4 border-gray-400">Tezos Master Key Setup</h2>
+            <p class="text-sm text-red-700 font-semibold mb-4">
+                This wallet address will be the permanent key to encrypt/decrypt all your data files and unlock the app. **DO NOT LOSE IT.**
+            </p>
+
+
+            <input id="wallet-address-enroll-input" type="text" placeholder="Enter Your Tezos Wallet Address" class="input-field w-full p-3 mb-4 rounded shadow-sm focus:ring-2 focus:ring-indigo-500">
+            
+            <button id="confirm-enroll-button" class="w-full bg-indigo-600 text-white py-3 rounded-lg font-bold hover:bg-indigo-700 transition duration-150">
+                Securely Enroll Key
+            </button>
+        </div>
+    </div>
+
+
+    <!-- 4. Centralized Modal for General Text Input (Load Address or Save Filename) -->
+    <div id="text-input-modal" class="hidden fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center p-4 z-50">
+        <div class="bg-white rounded-xl shadow-2xl w-full max-w-sm p-6 vault-container">
+            <h2 id="text-input-modal-title" class="text-xl font-bold text-gray-900 border-b pb-2 mb-4 border-gray-400">Action Title</h2>
+            <p id="text-input-modal-status" class="text-sm text-gray-700 mb-4 h-10">Status message here.</p>
+
+
+            <input id="text-input-modal-input" type="text" placeholder="Enter input here..." class="input-field w-full p-3 mb-4 rounded shadow-sm focus:ring-2 focus:ring-indigo-500">
+            
+            <div class="flex space-x-3">
+                <button id="cancel-text-input-button" class="flex-1 bg-gray-500 text-white py-3 rounded-lg font-bold hover:bg-gray-600 transition duration-150">
+                    Cancel
+                </button>
+                <button id="confirm-text-input-button" class="flex-1 bg-indigo-600 text-white py-3 rounded-lg font-bold hover:bg-indigo-700 transition duration-150">
+                    Confirm
+                </button>
+            </div>
+        </div>
+    </div>
+
+
+</body>
+</html>
